@@ -38,6 +38,9 @@ import (
 //go:embed info.yaml
 var Info embed.FS
 
+//go:embed ui/admin.html
+var adminHTML []byte
+
 func init() {
 	plugin.Register(&BadgeEditing{})
 }
@@ -109,6 +112,41 @@ func (b *BadgeEditing) RegisterAuthAdminRouter(r *gin.RouterGroup) {
 	r.GET("/badge-editing/badge-groups", b.ListBadgeGroups)
 	r.POST("/badge-editing/badges/award", b.AwardBadge)
 	r.DELETE("/badge-editing/badges/award", b.RevokeBadgeAward)
+	r.GET("/badge-editing/ui", b.AdminUI)
+}
+
+// --- Config interface ---
+
+func (b *BadgeEditing) ConfigFields() []plugin.ConfigField {
+	return []plugin.ConfigField{
+		{
+			Name:        "legend",
+			Type:        plugin.ConfigTypeLegend,
+			Title:       plugin.MakeTranslator(i18n.ConfigLegendTitle),
+			Description: plugin.MakeTranslator(i18n.ConfigLegendDescription),
+		},
+		{
+			Name:  "manage_button",
+			Type:  plugin.ConfigTypeButton,
+			Title: plugin.MakeTranslator(i18n.ConfigButtonTitle),
+			UIOptions: plugin.ConfigFieldUIOptions{
+				Text:    plugin.MakeTranslator(i18n.ConfigButtonLabel),
+				Variant: "outline-primary",
+				Action: &plugin.UIOptionAction{
+					Url: "/answer/admin/api/v1/badge-editing/ui",
+				},
+			},
+		},
+	}
+}
+
+func (b *BadgeEditing) ConfigReceiver(_ []byte) error {
+	return nil
+}
+
+// AdminUI serves the embedded management page.
+func (b *BadgeEditing) AdminUI(ctx *gin.Context) {
+	ctx.Data(http.StatusOK, "text/html; charset=utf-8", adminHTML)
 }
 
 // --- Request / Response Types ---

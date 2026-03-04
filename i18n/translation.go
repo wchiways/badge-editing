@@ -22,4 +22,9 @@ package i18n
 const (
 	InfoName        = "plugin.badge_editing.backend.info.name"
 	InfoDescription = "plugin.badge_editing.backend.info.description"
+
+	ConfigLegendTitle       = "plugin.badge_editing.backend.config.legend.title"
+	ConfigLegendDescription = "plugin.badge_editing.backend.config.legend.description"
+	ConfigButtonTitle       = "plugin.badge_editing.backend.config.button.title"
+	ConfigButtonLabel       = "plugin.badge_editing.backend.config.button.label"
 )

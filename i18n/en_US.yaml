@@ -23,3 +23,14 @@ plugin:
           other: Badge Editing
         description:
           other: Manage badges with full CRUD operations and manual awarding
+      config:
+        legend:
+          title:
+            other: Badge Editing
+          description:
+            other: Create, edit, delete badges and award/revoke badges to users.
+        button:
+          title:
+            other: Management Page
+          label:
+            other: Open Management Page
