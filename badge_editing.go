@@ -228,7 +228,9 @@ const (
 	badgeAwardNotDeleted = 0
 	badgeAwardDeleted    = 1
 
-	uniqIDTypeBadge = 6
+	// Object types matching Answer core (internal/base/constant/object_type.go)
+	objectTypeBadge      = 9
+	objectTypeBadgeAward = 10
 )
 
 // --- Helper ---
@@ -241,8 +243,11 @@ func (b *BadgeEditing) checkDB(ctx *gin.Context) bool {
 	return true
 }
 
-func formatID(id int64) string {
-	return fmt.Sprintf("%d", id)
+// genUniqueID generates an ID in the same format as Answer core:
+// "1" + 3-digit objectType + 13-digit autoincrement ID
+// e.g. objectType=9, id=42 => "10090000000000042"
+func genUniqueID(objectType int, id int64) string {
+	return fmt.Sprintf("1%03d%013d", objectType, id)
 }
 
 // --- Handlers ---
@@ -294,30 +299,35 @@ func (b *BadgeEditing) CreateBadge(ctx *gin.Context) {
 		return
 	}
 
-	// Generate unique ID
-	uniqID := &UniqueID{UniqIDType: uniqIDTypeBadge}
-	_, err = b.db.Insert(uniqID)
-	if err != nil {
-		log.Errorf("generate unique id failed: %v", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate unique id"})
-		return
-	}
+	var badge *Badge
+	_, err = b.db.Transaction(func(session *xorm.Session) (any, error) {
+		// Generate unique ID within transaction
+		uniqID := &UniqueID{UniqIDType: objectTypeBadge}
+		_, err := session.Insert(uniqID)
+		if err != nil {
+			return nil, fmt.Errorf("generate unique id: %w", err)
+		}
 
-	badge := &Badge{
-		ID:           formatID(uniqID.ID),
-		Name:         req.Name,
-		Icon:         req.Icon,
-		Description:  req.Description,
-		Status:       badgeStatusActive,
-		BadgeGroupID: req.BadgeGroupID,
-		Level:        req.Level,
-		Single:       req.Single,
-		Collect:      "",
-		Handler:      "",
-		Param:        "{}",
-	}
+		badge = &Badge{
+			ID:           genUniqueID(objectTypeBadge, uniqID.ID),
+			Name:         req.Name,
+			Icon:         req.Icon,
+			Description:  req.Description,
+			Status:       badgeStatusActive,
+			BadgeGroupID: req.BadgeGroupID,
+			Level:        req.Level,
+			Single:       req.Single,
+			Collect:      "",
+			Handler:      "",
+			Param:        "{}",
+		}
 
-	_, err = b.db.Insert(badge)
+		_, err = session.Insert(badge)
+		if err != nil {
+			return nil, fmt.Errorf("insert badge: %w", err)
+		}
+		return nil, nil
+	})
 	if err != nil {
 		log.Errorf("create badge failed: %v", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create badge"})
@@ -408,20 +418,26 @@ func (b *BadgeEditing) DeleteBadge(ctx *gin.Context) {
 		return
 	}
 
-	// Soft delete badge
-	_, err = b.db.ID(id).Cols("status").Update(&Badge{Status: badgeStatusDeleted})
+	_, err = b.db.Transaction(func(session *xorm.Session) (any, error) {
+		// Soft delete badge
+		_, err := session.ID(id).Cols("status").Update(&Badge{Status: badgeStatusDeleted})
+		if err != nil {
+			return nil, fmt.Errorf("update badge status: %w", err)
+		}
+
+		// Mark all related badge awards as deleted
+		_, err = session.Where("badge_id = ?", id).
+			Cols("is_badge_deleted").
+			Update(&BadgeAward{IsBadgeDeleted: badgeAwardDeleted})
+		if err != nil {
+			return nil, fmt.Errorf("mark badge awards deleted: %w", err)
+		}
+		return nil, nil
+	})
 	if err != nil {
 		log.Errorf("delete badge failed: %v", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete badge"})
 		return
-	}
-
-	// Mark all related badge awards as deleted
-	_, err = b.db.Where("badge_id = ?", id).
-		Cols("is_badge_deleted").
-		Update(&BadgeAward{IsBadgeDeleted: badgeAwardDeleted})
-	if err != nil {
-		log.Errorf("mark badge awards deleted failed: %v", err)
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "badge deleted successfully"})
@@ -462,7 +478,7 @@ func (b *BadgeEditing) AwardBadge(ctx *gin.Context) {
 		return
 	}
 
-	// Find user by username
+	// Find user by username (outside transaction, read-only)
 	user := &User{}
 	exists, err := b.db.Where("username = ? AND status = 1", req.Username).Get(user)
 	if err != nil {
@@ -475,63 +491,72 @@ func (b *BadgeEditing) AwardBadge(ctx *gin.Context) {
 		return
 	}
 
-	// Check badge exists and is active
-	badge := &Badge{}
-	badgeExists, err := b.db.ID(req.BadgeID).Get(badge)
-	if err != nil {
-		log.Errorf("find badge failed: %v", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to find badge"})
-		return
-	}
-	if !badgeExists || badge.Status != badgeStatusActive {
-		ctx.JSON(http.StatusNotFound, gin.H{"error": "badge not found or inactive"})
-		return
-	}
-
-	// For single-award badges, check if already awarded
-	if badge.Single == 1 {
-		existingAward := &BadgeAward{}
-		awarded, err := b.db.Where("badge_id = ? AND user_id = ?", req.BadgeID, user.ID).Get(existingAward)
+	var award *BadgeAward
+	_, err = b.db.Transaction(func(session *xorm.Session) (any, error) {
+		// Lock badge row with ForUpdate to prevent concurrent award races
+		badge := &Badge{}
+		badgeExists, err := session.ID(req.BadgeID).ForUpdate().Get(badge)
 		if err != nil {
-			log.Errorf("check award failed: %v", err)
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check existing award"})
+			return nil, fmt.Errorf("find badge: %w", err)
+		}
+		if !badgeExists || badge.Status != badgeStatusActive {
+			return nil, fmt.Errorf("badge not found or inactive")
+		}
+
+		// For single-award badges, check if already awarded (with is_badge_deleted=0)
+		if badge.Single == 1 {
+			existingAward := &BadgeAward{}
+			awarded, err := session.Where("badge_id = ? AND user_id = ? AND is_badge_deleted = ?",
+				req.BadgeID, user.ID, badgeAwardNotDeleted).Get(existingAward)
+			if err != nil {
+				return nil, fmt.Errorf("check existing award: %w", err)
+			}
+			if awarded {
+				return nil, fmt.Errorf("CONFLICT:badge already awarded to this user")
+			}
+		}
+
+		// Generate unique ID for the award within transaction
+		uniqID := &UniqueID{UniqIDType: objectTypeBadgeAward}
+		_, err = session.Insert(uniqID)
+		if err != nil {
+			return nil, fmt.Errorf("generate unique id: %w", err)
+		}
+
+		award = &BadgeAward{
+			ID:             genUniqueID(objectTypeBadgeAward, uniqID.ID),
+			UserID:         user.ID,
+			BadgeID:        req.BadgeID,
+			AwardKey:       "0",
+			BadgeGroupID:   badge.BadgeGroupID,
+			IsBadgeDeleted: badgeAwardNotDeleted,
+		}
+
+		_, err = session.Insert(award)
+		if err != nil {
+			return nil, fmt.Errorf("insert award: %w", err)
+		}
+
+		// Atomically increment award count
+		_, err = session.ID(req.BadgeID).Incr("award_count", 1).Update(&Badge{})
+		if err != nil {
+			return nil, fmt.Errorf("update award count: %w", err)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		errMsg := err.Error()
+		if len(errMsg) > 9 && errMsg[:9] == "CONFLICT:" {
+			ctx.JSON(http.StatusConflict, gin.H{"error": errMsg[9:]})
 			return
 		}
-		if awarded {
-			ctx.JSON(http.StatusConflict, gin.H{"error": "badge already awarded to this user"})
+		if errMsg == "badge not found or inactive" {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": errMsg})
 			return
 		}
-	}
-
-	// Generate unique ID for the award
-	uniqID := &UniqueID{UniqIDType: uniqIDTypeBadge}
-	_, err = b.db.Insert(uniqID)
-	if err != nil {
-		log.Errorf("generate unique id failed: %v", err)
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate unique id"})
-		return
-	}
-
-	award := &BadgeAward{
-		ID:             formatID(uniqID.ID),
-		UserID:         user.ID,
-		BadgeID:        req.BadgeID,
-		AwardKey:       "0",
-		BadgeGroupID:   badge.BadgeGroupID,
-		IsBadgeDeleted: badgeAwardNotDeleted,
-	}
-
-	_, err = b.db.Insert(award)
-	if err != nil {
 		log.Errorf("award badge failed: %v", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to award badge"})
 		return
-	}
-
-	// Update badge award count
-	_, err = b.db.ID(req.BadgeID).Incr("award_count", 1).Update(&Badge{})
-	if err != nil {
-		log.Errorf("update award count failed: %v", err)
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{
@@ -553,7 +578,7 @@ func (b *BadgeEditing) RevokeBadgeAward(ctx *gin.Context) {
 		return
 	}
 
-	// Find user by username
+	// Find user by username (outside transaction, read-only)
 	user := &User{}
 	exists, err := b.db.Where("username = ? AND status = 1", req.Username).Get(user)
 	if err != nil {
@@ -566,28 +591,39 @@ func (b *BadgeEditing) RevokeBadgeAward(ctx *gin.Context) {
 		return
 	}
 
-	// Delete the award records
-	count, err := b.db.Where("badge_id = ? AND user_id = ?", req.BadgeID, user.ID).Delete(&BadgeAward{})
+	var revokedCount int64
+	_, err = b.db.Transaction(func(session *xorm.Session) (any, error) {
+		// Delete the award records
+		count, err := session.Where("badge_id = ? AND user_id = ?", req.BadgeID, user.ID).Delete(&BadgeAward{})
+		if err != nil {
+			return nil, fmt.Errorf("delete awards: %w", err)
+		}
+		if count == 0 {
+			return nil, fmt.Errorf("NOT_FOUND:badge award not found for this user")
+		}
+		revokedCount = count
+
+		// Atomically decrement badge award count
+		_, err = session.ID(req.BadgeID).Decr("award_count", int(count)).Update(&Badge{})
+		if err != nil {
+			return nil, fmt.Errorf("update award count: %w", err)
+		}
+		return nil, nil
+	})
 	if err != nil {
+		errMsg := err.Error()
+		if len(errMsg) > 10 && errMsg[:10] == "NOT_FOUND:" {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": errMsg[10:]})
+			return
+		}
 		log.Errorf("revoke badge award failed: %v", err)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke badge award"})
 		return
 	}
 
-	if count == 0 {
-		ctx.JSON(http.StatusNotFound, gin.H{"error": "badge award not found for this user"})
-		return
-	}
-
-	// Update badge award count
-	_, err = b.db.ID(req.BadgeID).Decr("award_count", int(count)).Update(&Badge{})
-	if err != nil {
-		log.Errorf("update award count failed: %v", err)
-	}
-
 	ctx.JSON(http.StatusOK, gin.H{
 		"message":       "badge award revoked successfully",
-		"revoked_count": count,
+		"revoked_count": revokedCount,
 	})
 }
 
