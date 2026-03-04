@@ -1,4 +1,4 @@
-module github.com/apache/answer-plugins/badge-editing
+module github.com/wchiways/badge-editing
 
 go 1.23.0
 

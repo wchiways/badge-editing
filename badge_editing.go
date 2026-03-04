@@ -27,7 +27,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/apache/answer-plugins/badge-editing/i18n"
+	"github.com/wchiways/badge-editing/i18n"
 	"github.com/apache/answer-plugins/util"
 	"github.com/apache/answer/plugin"
 	"github.com/gin-gonic/gin"
